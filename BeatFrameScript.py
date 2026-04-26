@@ -6,7 +6,7 @@ pm = resolve.GetProjectManager()
 project = pm.GetCurrentProject()
 timeline = project.GetCurrentTimeline() 
 
-CSV_FILEPATH = "c:\Users\Ray\projects\hackathons\BeatFrame\timestamps.csv"
+CSV_FILEPATH = "PLACEHOLDER"
 with open(CSV_FILEPATH, mode='r', newline='') as file:
     reader = csv.reader(file)
     

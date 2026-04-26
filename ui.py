@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QMessageBox, QFrame, QSizePolicy,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QFontDataBase, QColor, QPalette
+from PySide6.QtGui import QFont, QColor, QPalette
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 RESOLVE_SCRIPT_PATH = os.path.expanduser("~/Documents/BeatFrame/resolve_apply.py")
