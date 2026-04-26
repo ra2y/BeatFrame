@@ -4,5 +4,5 @@ import sys
 
 app = QApplication(sys.argv)
 window = BeatFrameApp()
-window.show
+window.show()
 sys.exit(app.exec())

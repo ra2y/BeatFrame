@@ -560,10 +560,3 @@ class BeatFrameApp(QMainWindow):
     def show_analysis(self):
         self.setCentralWidget(self.analysis)
 
-
-# ── entry point ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = BeatFrameApp()
-    window.show()
-    sys.exit(app.exec())
