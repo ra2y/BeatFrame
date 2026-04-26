@@ -852,10 +852,10 @@ class AnalysisPage(QWidget):
             content = f.read()
         content = re.sub(
             r'CSV_FILEPATH\s*=\s*".*?"',
-            f'CSV_FILEPATH = "{csv_path}"',
+            lambda m: f'CSV_FILEPATH = "{csv_path_normalized}"',
             content,
         )
-        with open(RESOLVE_SCRIPT_PATH, "w", encoding="utf-8") as f:
+        with open(str(resolve_script), "w", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -869,6 +869,8 @@ class BeatFrameApp(QMainWindow):
         if not os.path.exists(OUTPUT_DIR):
             dialog = InstallDialog(self)
             dialog.exec()
+
+        self._ensure_resolve_script_installed()
 
         self.landing  = LandingPage()
         self.analysis = AnalysisPage()
