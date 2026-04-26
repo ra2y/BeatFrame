@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QDialog, QMessageBox, QFrame, QSizePolicy,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPointF
-from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient
+from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 # ── paths ──────────────────────────────────────────────────────────────────────
@@ -147,30 +147,79 @@ class LandingPage(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(16)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(0)
+        layout.setContentsMargins(60, 0, 60, 40)
+
+        # ── hero section ──────────────────────────────────────────────────────
+        layout.addStretch(2)
+
+        title_row = QHBoxLayout()
+        title_row.setAlignment(Qt.AlignCenter)
+        title_row.setSpacing(14)
+
+        logo = QLabel()
+        dpr = self.devicePixelRatio()
+        size = 58
+        pixmap = QPixmap("soundicon.png").scaled(
+            int(size * dpr), int(size * dpr),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        pixmap.setDevicePixelRatio(dpr)
+        logo.setPixmap(pixmap)
+        logo.setFixedSize(size, size)
+        logo.setAlignment(Qt.AlignVCenter)
 
         title = QLabel("BeatFrame")
-        title.setStyleSheet("font-size: 28px; font-weight: 500;")
-        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 50px; font-weight: 700; letter-spacing: -1px;")
+        title.setAlignment(Qt.AlignVCenter)
+
+        title_row.addWidget(logo)
+        title_row.addWidget(title)
+        layout.addLayout(title_row)
+
+        layout.addSpacing(12)
 
         subtitle = QLabel(
             "Sync your video edits to music — automatically.\n"
             "Analyze a track, preview the beat drops, export to Resolve."
         )
-        subtitle.setStyleSheet("font-size: 14px; color: #666;")
+        subtitle.setStyleSheet("font-size: 15px; color: #888; line-height: 1.5;")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
 
-        btn = QPushButton("Get started")
-        btn.setFixedWidth(160)
+        layout.addSpacing(24)
+
+        btn = QPushButton("Get started →")
+        btn.setFixedWidth(150)
         btn.setStyleSheet(
             "background: #534AB7; color: white; border: none;"
-            "padding: 10px; border-radius: 8px; font-size: 14px; font-weight: 500;"
+            "padding: 11px 24px; border-radius: 8px; font-size: 14px; font-weight: 600;"
         )
         btn.clicked.connect(self.get_started)
+        layout.addWidget(btn, alignment=Qt.AlignCenter)
 
+        layout.addStretch(1)
+
+        # ── divider ───────────────────────────────────────────────────────────
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setStyleSheet("color: #e0e0e0;")
+        layout.addWidget(divider)
+
+        layout.addSpacing(24)
+
+        # ── how it works label ────────────────────────────────────────────────
+        how_label = QLabel("HOW IT WORKS")
+        how_label.setStyleSheet("font-size: 11px; font-weight: 600; color: #aaa; letter-spacing: 2px;")
+        how_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(how_label)
+
+        layout.addSpacing(16)
+
+        # ── cards ─────────────────────────────────────────────────────────────
         cards_row = QHBoxLayout()
+        cards_row.setSpacing(12)
         for title_txt, body_txt in [
             ("Analyze",  "Upload audio, detect beats, peaks, and mood sections"),
             ("Preview",  "See every beat drop flash in real time before exporting"),
@@ -178,25 +227,23 @@ class LandingPage(QWidget):
         ]:
             card = QFrame()
             card.setStyleSheet(
-                "background: #f8f8f8; border-radius: 8px;"
-                "border: 1px solid #e0e0e0; padding: 4px;"
+                "background: white; border-radius: 10px; border: 1px solid #e8e8e8;"
             )
+            card.setMinimumHeight(110)
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(12, 12, 12, 12)
+            cl.setContentsMargins(16, 16, 16, 16)
+            cl.setSpacing(6)
             ct = QLabel(title_txt)
-            ct.setStyleSheet("font-size: 13px; font-weight: 500;")
+            ct.setStyleSheet("font-size: 13px; font-weight: 600; border: none;")
             cb = QLabel(body_txt)
-            cb.setStyleSheet("font-size: 12px; color: #666;")
+            cb.setStyleSheet("font-size: 12px; color: #888; border: none;")
             cb.setWordWrap(True)
             cl.addWidget(ct)
             cl.addWidget(cb)
             cards_row.addWidget(card)
 
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addWidget(btn, alignment=Qt.AlignCenter)
-        layout.addSpacing(16)
         layout.addLayout(cards_row)
+        layout.addSpacing(24)
 
 
 # ── beat timeline canvas ───────────────────────────────────────────────────────
@@ -698,7 +745,7 @@ class AnalysisPage(QWidget):
 
         note = QFrame()
         note.setStyleSheet(
-            "background: #FAEEDA; border-radius: 8px; border: 1px solid #EF9F27;"
+            "background: #FAEEDA; border-radius: 8px;"
         )
         nl = QVBoxLayout(note)
         nl.setContentsMargins(10, 10, 10, 10)
@@ -706,8 +753,8 @@ class AnalysisPage(QWidget):
         note_title = QLabel("Next step")
         note_title.setStyleSheet("font-size: 12px; font-weight: 500; color: #633806;")
         note_body = QLabel(
-            "Happy with the results? Go back to DaVinci Resolve, "
-            "click Workspace at the top > Scripts > Utility > BeatFrameScript.py "
+            "Happy with the results? Go back to DaVinci Resolve, click "
+            "Workspace> Scripts > Utility > BeatFrameScript.py "
             "to place markers on your timeline."
         )
         note_body.setStyleSheet("font-size: 11px; color: #854F0B;")
