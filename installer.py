@@ -44,7 +44,7 @@ def install_script(source_file):
     dest_file = dest_dir / Path(source_file).name
     shutil.copy2(source_file, dest_file)
 
-    print(f"Copied to: {dest_file}")
+    print(f"✓ BeatFrameScript.py installed to: {dest_file}")
 
 # install script to davinci resolve of user
 install_script("BeatFrameScript.py")

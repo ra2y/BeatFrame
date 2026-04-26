@@ -12,9 +12,26 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QColor, QPalette
 
 # ── paths ──────────────────────────────────────────────────────────────────────
-RESOLVE_SCRIPT_PATH = os.path.expanduser("~/Documents/BeatFrame/resolve_apply.py")
 OUTPUT_DIR          = os.path.expanduser("~/Documents/BeatFrame/")
 INSTALLER_SCRIPT    = os.path.join(os.path.dirname(__file__), "installer.py")
+
+# Path to BeatFrameScript.py in DaVinci Resolve's Scripts folder
+def get_resolve_script_path():
+    import platform
+    from pathlib import Path
+    home = Path.home()
+    system = platform.system()
+    
+    if system == "Darwin":  # macOS
+        scripts_dir = home / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts"
+    elif system == "Windows":
+        scripts_dir = home / "AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts"
+    elif system == "Linux":
+        scripts_dir = home / ".local/share/DaVinciResolve/Fusion/Scripts"
+    else:
+        return None
+    
+    return scripts_dir / "BeatFrameScript.py"
 
 
 # ── background worker ──────────────────────────────────────────────────────────
@@ -527,17 +544,22 @@ class AnalysisPage(QWidget):
 
     # ── patch resolve script with the new csv path ─────────────────────────────
     def _inject_csv_path(self, csv_path: str):
-        if not os.path.exists(RESOLVE_SCRIPT_PATH):
+        """Update the CSV path in BeatFrameScript.py inside DaVinci Resolve."""
+        resolve_script = get_resolve_script_path()
+        if not resolve_script or not os.path.exists(str(resolve_script)):
             return
         import re
-        with open(RESOLVE_SCRIPT_PATH, "r", encoding="utf-8") as f:
+        # Normalize path to forward slashes (works on all platforms: Windows/Mac/Linux)
+        # Windows: C:\path\file → C:/path/file | Mac/Linux: /path/file → /path/file (unchanged)
+        csv_path_normalized = csv_path.replace('\\', '/')
+        with open(str(resolve_script), "r", encoding="utf-8") as f:
             content = f.read()
         content = re.sub(
             r'CSV_FILEPATH\s*=\s*".*?"',
-            f'CSV_FILEPATH = "{csv_path}"',
+            f'CSV_FILEPATH = "{csv_path_normalized}"',
             content,
         )
-        with open(RESOLVE_SCRIPT_PATH, "w", encoding="utf-8") as f:
+        with open(str(resolve_script), "w", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -548,14 +570,35 @@ class BeatFrameApp(QMainWindow):
         self.setWindowTitle("BeatFrame")
         self.setMinimumSize(680, 520)
 
-        if not os.path.exists(OUTPUT_DIR):
-            dialog = InstallDialog(self)
-            dialog.exec()
+        # Check if DaVinci Resolve script exists; if not, run installer
+        self._ensure_resolve_script_installed()
 
         self.landing  = LandingPage()
         self.analysis = AnalysisPage()
         self.landing.get_started.connect(self.show_analysis)
         self.setCentralWidget(self.landing)
+
+    def _ensure_resolve_script_installed(self):
+        """Check if DaVinci Resolve script exists; run installer if missing."""
+        resolve_script = get_resolve_script_path()
+        if resolve_script and not os.path.exists(str(resolve_script)):
+            print(f"BeatFrameScript.py not found at {resolve_script}. Running installer...")
+            # Create output directory if it doesn't exist
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            
+            # Run installer script
+            if os.path.exists(INSTALLER_SCRIPT):
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        [sys.executable, INSTALLER_SCRIPT],
+                        capture_output=True, text=True
+                    )
+                    print(result.stdout)  # Print installer output
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Installer failed: {result.stderr}")
+                except Exception as e:
+                    print(f"Warning: Could not install DaVinci script: {e}")
 
     def show_analysis(self):
         self.setCentralWidget(self.analysis)
