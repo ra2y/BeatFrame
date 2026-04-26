@@ -8,8 +8,9 @@ from PySide6.QtWidgets import (
     QFileDialog, QSlider, QVBoxLayout, QHBoxLayout, QGridLayout,
     QDialog, QMessageBox, QFrame, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QFont, QColor, QPalette
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl, QPointF
+from PySide6.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 OUTPUT_DIR          = os.path.dirname(__file__)  # Project directory for timestamps.csv
@@ -198,22 +199,345 @@ class LandingPage(QWidget):
         layout.addLayout(cards_row)
 
 
+# ── beat timeline canvas ───────────────────────────────────────────────────────
+class BeatTimeline(QWidget):
+    """
+    Draws a horizontal timeline with:
+      - cut point markers (purple ticks)
+      - a moving playhead
+      - a flash highlight when the playhead crosses a cut point
+    """
+    seek_requested = Signal(float)   # fraction 0-1
+
+    FLASH_MS = 120
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(54)
+        self.setMaximumHeight(54)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setCursor(Qt.PointingHandCursor)
+
+        self._duration    = 1.0    # seconds
+        self._position    = 0.0    # seconds
+        self._cut_points  = []     # list of float seconds
+        self._flash_on    = False
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._end_flash)
+        self._next_cut_idx = 0
+
+    def set_cut_points(self, points, duration):
+        self._cut_points   = sorted(points)
+        self._duration     = max(duration, 1.0)
+        self._next_cut_idx = 0
+        self.update()
+
+    def set_position(self, seconds: float):
+        prev = self._position
+        self._position = seconds
+
+        # fire flash when we pass a cut point
+        while (self._next_cut_idx < len(self._cut_points) and
+               seconds >= self._cut_points[self._next_cut_idx]):
+            self._next_cut_idx += 1
+            self._start_flash()
+
+        # reset index if playback jumped backward
+        if seconds < prev - 0.5:
+            self._next_cut_idx = sum(1 for c in self._cut_points if c <= seconds)
+
+        self.update()
+
+    def reset(self):
+        self._position     = 0.0
+        self._next_cut_idx = 0
+        self._flash_on     = False
+        self.update()
+
+    def _start_flash(self):
+        self._flash_on = True
+        self._flash_timer.start(self.FLASH_MS)
+        self.update()
+
+    def _end_flash(self):
+        self._flash_on = False
+        self.update()
+
+    # ── painting ───────────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # background
+        bg = QColor("#f0f0f0") if not self._flash_on else QColor("#e8e5ff")
+        p.fillRect(0, 0, w, h, bg)
+
+        # track groove
+        groove_y = h // 2
+        groove_h = 6
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#d0d0d0"))
+        p.drawRoundedRect(12, groove_y - groove_h // 2, w - 24, groove_h, 3, 3)
+
+        # played portion
+        pct = self._position / self._duration
+        played_w = int((w - 24) * pct)
+        if played_w > 0:
+            p.setBrush(QColor("#534AB7"))
+            p.drawRoundedRect(12, groove_y - groove_h // 2, played_w, groove_h, 3, 3)
+
+        # cut point ticks
+        tick_h = 16
+        p.setPen(QPen(QColor("#534AB7"), 2))
+        for cp in self._cut_points:
+            x = 12 + int((w - 24) * (cp / self._duration))
+            p.drawLine(x, groove_y - tick_h // 2, x, groove_y + tick_h // 2)
+
+        # playhead
+        ph_x = 12 + int((w - 24) * pct)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(ph_x - 7, groove_y - 7, 14, 14)
+        p.setBrush(QColor("#534AB7") if not self._flash_on else QColor("#D85A30"))
+        p.drawEllipse(ph_x - 5, groove_y - 5, 10, 10)
+
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            frac = (event.position().x() - 12) / max(self.width() - 24, 1)
+            frac = max(0.0, min(1.0, frac))
+            self.seek_requested.emit(frac)
+
+
+# ── beat flash indicator widget ────────────────────────────────────────────────
+class BeatFlashWidget(QWidget):
+    """
+    A small pill that pulses through colors on each beat.
+    Idle: grey. On beat: cycles purple → orange → teal, fading back.
+    """
+    COLORS = ["#534AB7", "#D85A30", "#1D9E75", "#C4820A"]
+    FADE_MS = 180
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(52, 24)
+        self._color     = QColor("#cccccc")
+        self._target    = QColor("#cccccc")
+        self._color_idx = 0
+        self._active    = False
+
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(12)   # ~80 fps fade
+        self._fade_timer.timeout.connect(self._fade_step)
+
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._start_fade_out)
+
+    def flash(self):
+        col = self.COLORS[self._color_idx % len(self.COLORS)]
+        self._color_idx += 1
+        self._color  = QColor(col)
+        self._target = QColor(col)
+        self._active = True
+        self._fade_timer.stop()
+        self._hold_timer.start(self.FADE_MS)
+        self.update()
+
+    def _start_fade_out(self):
+        self._target = QColor("#cccccc")
+        self._fade_timer.start()
+
+    def _fade_step(self):
+        # lerp current color toward target
+        r = self._color.red()   + (self._target.red()   - self._color.red())   // 4
+        g = self._color.green() + (self._target.green() - self._color.green()) // 4
+        b = self._color.blue()  + (self._target.blue()  - self._color.blue())  // 4
+        self._color = QColor(r, g, b)
+        self.update()
+        if abs(r - self._target.red()) < 3 and abs(g - self._target.green()) < 3:
+            self._fade_timer.stop()
+            self._color  = self._target
+            self._active = False
+            self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self._color)
+        p.drawRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+        if self._active:
+            p.setPen(QColor(255, 255, 255, 200))
+            p.setFont(QFont("Arial", 9, QFont.Bold))
+            p.drawText(self.rect(), Qt.AlignCenter, "◉")
+        p.end()
+
+
+# ── audio player widget ────────────────────────────────────────────────────────
+class AudioPlayerWidget(QFrame):
+    """
+    Full audio player: play/pause, seek timeline with beat markers, time label.
+    Uses QMediaPlayer (PySide6 built-in, no extra deps).
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "background: #f8f8f8; border-radius: 10px; border: 1px solid #e0e0e0;"
+        )
+
+        self._player = QMediaPlayer(self)
+        self._audio  = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio)
+        self._audio.setVolume(1.0)
+        self._duration_sec = 0.0
+        self._cut_points   = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        # top row: track name + time
+        top = QHBoxLayout()
+        self._track_label = QLabel("No track loaded")
+        self._track_label.setStyleSheet(
+            "font-size: 12px; font-weight: 500; color: #333; border: none;"
+        )
+        self._time_label = QLabel("0:00 / 0:00")
+        self._time_label.setStyleSheet("font-size: 11px; color: #888; border: none;")
+        top.addWidget(self._track_label)
+        top.addStretch()
+        top.addWidget(self._time_label)
+        layout.addLayout(top)
+
+        # timeline
+        self._timeline = BeatTimeline(self)
+        self._timeline.seek_requested.connect(self._on_seek)
+        layout.addWidget(self._timeline)
+
+        # controls row
+        ctrl = QHBoxLayout()
+        self._play_btn = QPushButton("▶  Play")
+        self._play_btn.setFixedWidth(90)
+        self._play_btn.setEnabled(False)
+        self._play_btn.setStyleSheet(
+            "background: #534AB7; color: white; border: none;"
+            "padding: 6px 12px; border-radius: 6px; font-size: 12px;"
+        )
+        self._play_btn.clicked.connect(self.toggle_play)
+
+        vol_label = QLabel("Vol")
+        vol_label.setStyleSheet("font-size: 11px; color: #aaa; border: none;")
+        self._vol_slider = QSlider(Qt.Horizontal)
+        self._vol_slider.setRange(0, 100)
+        self._vol_slider.setValue(100)
+        self._vol_slider.setFixedWidth(80)
+        self._vol_slider.valueChanged.connect(
+            lambda v: self._audio.setVolume(v / 100.0)
+        )
+
+        self._beat_flash = BeatFlashWidget()
+
+        ctrl.addWidget(self._play_btn)
+        ctrl.addSpacing(10)
+        ctrl.addWidget(vol_label)
+        ctrl.addWidget(self._vol_slider)
+        ctrl.addStretch()
+        ctrl.addWidget(self._beat_flash)
+        layout.addLayout(ctrl)
+
+        # poll position every 40 ms (~25 fps)
+        self._poll = QTimer(self)
+        self._poll.setInterval(40)
+        self._poll.timeout.connect(self._tick)
+
+        self._player.playbackStateChanged.connect(self._on_state_change)
+        self._player.durationChanged.connect(self._on_duration_changed)
+
+    # ── public API ─────────────────────────────────────────────────────────────
+    def load(self, audio_path: str, cut_points: list, duration: float):
+        self._player.stop()
+        self._poll.stop()
+        self._cut_points   = cut_points
+        self._duration_sec = duration
+        self._timeline.set_cut_points(cut_points, duration)
+        self._timeline.reset()
+        self._track_label.setText(os.path.basename(audio_path))
+        self._time_label.setText(f"0:00 / {self._fmt(duration)}")
+        self._play_btn.setEnabled(True)
+        self._play_btn.setText("▶  Play")
+        self._beat_flash._color = QColor("#cccccc")
+        self._beat_flash._active = False
+        self._beat_flash.update()
+        self._player.setSource(QUrl.fromLocalFile(os.path.abspath(audio_path)))
+
+    def toggle_play(self):
+        if self._player.playbackState() == QMediaPlayer.PlayingState:
+            self._player.pause()
+            self._poll.stop()
+            self._play_btn.setText("▶  Play")
+        else:
+            self._player.play()
+            self._poll.start()
+            self._play_btn.setText("⏸  Pause")
+
+    # ── internals ──────────────────────────────────────────────────────────────
+    def _tick(self):
+        ms  = self._player.position()
+        sec = ms / 1000.0
+        prev_flash = self._timeline._flash_on
+        self._timeline.set_position(sec)
+        self._time_label.setText(f"{self._fmt(sec)} / {self._fmt(self._duration_sec)}")
+
+        # trigger flash widget when timeline just turned on
+        if self._timeline._flash_on and not prev_flash:
+            self._beat_flash.flash()
+
+    def _on_seek(self, frac: float):
+        ms = int(frac * self._duration_sec * 1000)
+        self._player.setPosition(ms)
+        self._timeline.set_position(frac * self._duration_sec)
+
+    def _on_duration_changed(self, ms: int):
+        if ms > 0 and self._duration_sec == 0:
+            self._duration_sec = ms / 1000.0
+            self._timeline.set_cut_points(self._cut_points, self._duration_sec)
+
+    def _on_state_change(self, state):
+        if state == QMediaPlayer.StoppedState:
+            self._poll.stop()
+            self._play_btn.setText("▶  Play")
+            self._timeline.reset()
+
+    @staticmethod
+    def _fmt(sec: float) -> str:
+        m = int(sec) // 60
+        s = int(sec) % 60
+        return f"{m}:{s:02d}"
+
+
 # ── main analysis page ─────────────────────────────────────────────────────────
 class AnalysisPage(QWidget):
     def __init__(self):
         super().__init__()
         self.audio_path  = None
         self.worker      = None
-        self.cut_points  = []        # populated after analysis, used by flash preview
+        self.cut_points  = []
+        self.duration    = 0.0       # filled after analysis
 
-        # flash overlay
-        self.flash_overlay = QWidget(self)
-        self.flash_overlay.setStyleSheet("background: rgba(83,74,183,160);")
-        self.flash_overlay.hide()
-
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # ── top area: left + right panels side by side ────────────────────────
+        top_area = QWidget()
+        top_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        top_layout = QHBoxLayout(top_area)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
 
         # ── left panel ────────────────────────────────────────────────────────
         left = QWidget()
@@ -224,6 +548,7 @@ class AnalysisPage(QWidget):
 
         # drop zone
         drop_frame = QFrame()
+        drop_frame.setFixedHeight(90)
         drop_frame.setStyleSheet(
             "border: 2px dashed #ccc; border-radius: 8px; background: #fafafa;"
         )
@@ -300,30 +625,6 @@ class AnalysisPage(QWidget):
             row.addWidget(slider)
             row.addWidget(val_label)
             ll.addLayout(row)
-
-        # beat flash preview
-        flash_title = QLabel("Beat drop preview")
-        flash_title.setStyleSheet("font-size: 11px; color: #aaa;")
-        ll.addWidget(flash_title)
-
-        flash_row = QFrame()
-        flash_row.setStyleSheet(
-            "background: #f4f4f4; border-radius: 8px; border: 1px solid #e0e0e0;"
-        )
-        fl2 = QHBoxLayout(flash_row)
-        fl2.setContentsMargins(10, 8, 10, 8)
-        flash_desc = QLabel("Flash at the top N detected cut points")
-        flash_desc.setStyleSheet("font-size: 12px; color: #555; border: none;")
-        self.flash_btn = QPushButton("Preview flashes")
-        self.flash_btn.setFixedWidth(110)
-        self.flash_btn.setEnabled(False)      # enabled only after analysis
-        self.flash_btn.clicked.connect(self.run_flash)
-        fl2.addWidget(flash_desc)
-        fl2.addStretch()
-        fl2.addWidget(self.flash_btn)
-        ll.addWidget(flash_row)
-
-        ll.addStretch()
 
         # analyze button
         self.analyze_btn = QPushButton("Analyze and export CSV")
@@ -415,9 +716,27 @@ class AnalysisPage(QWidget):
         nl.addWidget(note_body)
         rl.addWidget(note)
 
-        root.addWidget(left)
-        root.addWidget(divider)
-        root.addWidget(right)
+        top_layout.addWidget(left)
+        top_layout.addWidget(divider)
+        top_layout.addWidget(right)
+
+        # ── bottom player bar — always visible ────────────────────────────────
+        player_bar = QFrame()
+        player_bar.setStyleSheet(
+            "background: #f0eff8; border-top: 1px solid #ddd;"
+        )
+        player_bar.setFixedHeight(130)
+        player_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        pb_layout = QVBoxLayout(player_bar)
+        pb_layout.setContentsMargins(16, 8, 16, 8)
+        pb_layout.setSpacing(0)
+
+        self.player = AudioPlayerWidget()
+        pb_layout.addWidget(self.player)
+
+        # top_area gets all remaining space; player_bar stays fixed at bottom
+        root.addWidget(top_area, stretch=1)
+        root.addWidget(player_bar, stretch=0)
 
     # ── browse file ────────────────────────────────────────────────────────────
     def browse_file(self):
@@ -434,39 +753,9 @@ class AnalysisPage(QWidget):
             self.file_status.setText("loaded")
             # reset results from any previous file
             self.cut_points = []
-            self.flash_btn.setEnabled(False)
             self.export_label.hide()
 
-    # ── flash preview — plays through actual cut points ────────────────────────
-    def run_flash(self):
-        if not self.cut_points:
-            return
-        self.flash_btn.setEnabled(False)
-        self.flash_btn.setText("Playing...")
-        # show flashes for the first top_n cut points
-        n = min(self.sliders["top_n"].value(), len(self.cut_points))
-        self._flash_queue = list(self.cut_points[:n])
-        self._flash_index = 0
-        self._advance_flash()
-
-    def _advance_flash(self):
-        if self._flash_index >= len(self._flash_queue):
-            self.flash_overlay.hide()
-            self.flash_btn.setEnabled(True)
-            self.flash_btn.setText("Preview flashes")
-            return
-        self.flash_overlay.setGeometry(self.rect())
-        self.flash_overlay.raise_()
-        self.flash_overlay.show()
-        self._flash_index += 1
-        QTimer.singleShot(150, self._hide_flash)
-
-    def _hide_flash(self):
-        self.flash_overlay.hide()
-        QTimer.singleShot(300, self._advance_flash)
-
     def resizeEvent(self, event):
-        self.flash_overlay.setGeometry(self.rect())
         super().resizeEvent(event)
 
     # ── run analysis ───────────────────────────────────────────────────────────
@@ -478,7 +767,6 @@ class AnalysisPage(QWidget):
         self.analyze_btn.setEnabled(False)
         self.analyze_btn.setText("Analyzing…")
         self.export_label.hide()
-        self.flash_btn.setEnabled(False)
 
         self.worker = AnalyzeWorker(
             audio_path  = self.audio_path,
@@ -518,7 +806,11 @@ class AnalysisPage(QWidget):
             )
 
             # store cut points so flash preview can use them
-            self.cut_points = m.get("cut_points", [])
+            self.cut_points  = m.get("cut_points", [])
+            self.duration    = m.get("duration", 0.0)
+
+            # load player with real beat markers
+            self.player.load(self.audio_path, self.cut_points, self.duration)
 
             # timestamp list
             for i in reversed(range(self.ts_layout.count())):
@@ -532,9 +824,9 @@ class AnalysisPage(QWidget):
                 row.setStyleSheet("font-size: 11px; font-family: monospace; color: #333;")
                 self.ts_layout.addWidget(row)
 
-        # enable flash preview now that we have real cut points
+        # enable player now that we have real cut points
         if self.cut_points:
-            self.flash_btn.setEnabled(True)
+            self.player._play_btn.setEnabled(True)
 
     # ── called when AnalyzeWorker emits error(msg) ─────────────────────────────
     def on_analysis_error(self, msg: str):
@@ -560,10 +852,10 @@ class AnalysisPage(QWidget):
             content = f.read()
         content = re.sub(
             r'CSV_FILEPATH\s*=\s*".*?"',
-            f'CSV_FILEPATH = "{csv_path_normalized}"',
+            f'CSV_FILEPATH = "{csv_path}"',
             content,
         )
-        with open(str(resolve_script), "w", encoding="utf-8") as f:
+        with open(RESOLVE_SCRIPT_PATH, "w", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -572,10 +864,11 @@ class BeatFrameApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BeatFrame")
-        self.setMinimumSize(680, 520)
+        self.setMinimumSize(680, 680)
 
-        # Check if DaVinci Resolve script exists; if not, run installer
-        self._ensure_resolve_script_installed()
+        if not os.path.exists(OUTPUT_DIR):
+            dialog = InstallDialog(self)
+            dialog.exec()
 
         self.landing  = LandingPage()
         self.analysis = AnalysisPage()
@@ -617,4 +910,3 @@ class BeatFrameApp(QMainWindow):
 
     def show_analysis(self):
         self.setCentralWidget(self.analysis)
-
