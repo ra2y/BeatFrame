@@ -6,7 +6,7 @@ pm = resolve.GetProjectManager()
 project = pm.GetCurrentProject()
 timeline = project.GetCurrentTimeline() 
 
-CSV_FILEPATH = "PLACEHOLDER"
+CSV_FILEPATH = "/Users/tiffany/BeatFrame/timestamps.csv"
 with open(CSV_FILEPATH, mode='r', newline='') as file:
     reader = csv.reader(file)
     

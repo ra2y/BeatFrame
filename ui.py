@@ -1,5 +1,8 @@
 import sys
 import os
+import json
+from pathlib import Path
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QFileDialog, QSlider, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -14,9 +17,9 @@ OUTPUT_DIR          = os.path.expanduser("~/Documents/BeatFrame/")
 INSTALLER_SCRIPT    = os.path.join(os.path.dirname(__file__), "installer.py")
 
 
-# ── background worker so the UI doesn't freeze while librosa runs ───────────
+# ── background worker ──────────────────────────────────────────────────────────
 class AnalyzeWorker(QThread):
-    finished = Signal(str)   # emits the csv path when done
+    finished = Signal(str)   # emits csv path
     error    = Signal(str)
 
     def __init__(self, audio_path, sensitivity, max_markers, min_gap, top_n):
@@ -29,7 +32,7 @@ class AnalyzeWorker(QThread):
 
     def run(self):
         try:
-            from analyze import analyze_audio   # your librosa script
+            from analyze import analyze_audio          # ← matches the real function name
             csv_path = analyze_audio(
                 self.audio_path,
                 sensitivity  = self.sensitivity,
@@ -40,7 +43,8 @@ class AnalyzeWorker(QThread):
             )
             self.finished.emit(csv_path)
         except Exception as e:
-            self.error.emit(str(e))
+            import traceback
+            self.error.emit(traceback.format_exc())
 
 
 # ── install-check popup ────────────────────────────────────────────────────────
@@ -67,7 +71,7 @@ class InstallDialog(QDialog):
         desc.setStyleSheet("font-size: 13px; color: #666;")
         layout.addWidget(desc)
 
-        path_label = QLabel(RESOLVE_SCRIPT_PATH)
+        path_label = QLabel(OUTPUT_DIR)
         path_label.setStyleSheet(
             "font-family: monospace; font-size: 11px; background: #f4f4f4;"
             "padding: 6px 10px; border-radius: 6px; color: #444;"
@@ -98,10 +102,17 @@ class InstallDialog(QDialog):
         self.install_btn.setText("Creating...")
         try:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
-            # copy resolve_apply.py template if installer script exists
+
+            # run installer.py if it exists — it copies BeatFrameScript.py to Resolve
             if os.path.exists(INSTALLER_SCRIPT):
                 import subprocess
-                subprocess.run([sys.executable, INSTALLER_SCRIPT], check=True)
+                result = subprocess.run(
+                    [sys.executable, INSTALLER_SCRIPT],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr)
+
             self.status.setText("Folder created. Continuing to BeatFrame...")
             self.status.show()
             QTimer.singleShot(1400, self.accept)
@@ -142,12 +153,11 @@ class LandingPage(QWidget):
         )
         btn.clicked.connect(self.get_started)
 
-        # three feature cards
         cards_row = QHBoxLayout()
         for title_txt, body_txt in [
             ("Analyze",  "Upload audio, detect beats, peaks, and mood sections"),
             ("Preview",  "See every beat drop flash in real time before exporting"),
-            ("Export",   "Save a JSON file, then run the Resolve script to apply markers"),
+            ("Export",   "Save a CSV + JSON, then run the Resolve script to apply markers"),
         ]:
             card = QFrame()
             card.setStyleSheet(
@@ -176,10 +186,11 @@ class LandingPage(QWidget):
 class AnalysisPage(QWidget):
     def __init__(self):
         super().__init__()
-        self.audio_path = None
-        self.worker     = None
+        self.audio_path  = None
+        self.worker      = None
+        self.cut_points  = []        # populated after analysis, used by flash preview
 
-        # flash overlay (sits on top of everything)
+        # flash overlay
         self.flash_overlay = QWidget(self)
         self.flash_overlay.setStyleSheet("background: rgba(83,74,183,160);")
         self.flash_overlay.hide()
@@ -285,10 +296,11 @@ class AnalysisPage(QWidget):
         )
         fl2 = QHBoxLayout(flash_row)
         fl2.setContentsMargins(10, 8, 10, 8)
-        flash_desc = QLabel("Flash screen 3× at detected peaks")
+        flash_desc = QLabel("Flash at the top N detected cut points")
         flash_desc.setStyleSheet("font-size: 12px; color: #555; border: none;")
-        self.flash_btn = QPushButton("Test flash")
-        self.flash_btn.setFixedWidth(90)
+        self.flash_btn = QPushButton("Preview flashes")
+        self.flash_btn.setFixedWidth(110)
+        self.flash_btn.setEnabled(False)      # enabled only after analysis
         self.flash_btn.clicked.connect(self.run_flash)
         fl2.addWidget(flash_desc)
         fl2.addStretch()
@@ -329,7 +341,6 @@ class AnalysisPage(QWidget):
         results_title.setStyleSheet("font-size: 11px; color: #aaa;")
         rl.addWidget(results_title)
 
-        # stat cards grid
         stat_grid = QGridLayout()
         stat_grid.setSpacing(8)
         self.stat_labels = {}
@@ -350,7 +361,6 @@ class AnalysisPage(QWidget):
             stat_grid.addWidget(card, i // 2, i % 2)
         rl.addLayout(stat_grid)
 
-        # top timestamps list
         ts_title = QLabel("Top peak timestamps")
         ts_title.setStyleSheet("font-size: 11px; color: #aaa;")
         rl.addWidget(ts_title)
@@ -369,7 +379,6 @@ class AnalysisPage(QWidget):
 
         rl.addStretch()
 
-        # next step note
         note = QFrame()
         note.setStyleSheet(
             "background: #FAEEDA; border-radius: 8px; border: 1px solid #EF9F27;"
@@ -406,108 +415,129 @@ class AnalysisPage(QWidget):
             self.file_name_label.setText(name)
             self.file_meta_label.setText(f"{size} KB")
             self.file_status.setText("loaded")
+            # reset results from any previous file
+            self.cut_points = []
+            self.flash_btn.setEnabled(False)
+            self.export_label.hide()
 
-    # ── beat flash preview ─────────────────────────────────────────────────────
+    # ── flash preview — plays through actual cut points ────────────────────────
     def run_flash(self):
+        if not self.cut_points:
+            return
         self.flash_btn.setEnabled(False)
-        self.flash_btn.setText("Flashing...")
-        self._flash_count = 0
-        self._do_flash()
+        self.flash_btn.setText("Playing...")
+        # show flashes for the first top_n cut points
+        n = min(self.sliders["top_n"].value(), len(self.cut_points))
+        self._flash_queue = list(self.cut_points[:n])
+        self._flash_index = 0
+        self._advance_flash()
 
-    def _do_flash(self):
-        if self._flash_count >= 3:
+    def _advance_flash(self):
+        if self._flash_index >= len(self._flash_queue):
             self.flash_overlay.hide()
             self.flash_btn.setEnabled(True)
-            self.flash_btn.setText("Test flash")
+            self.flash_btn.setText("Preview flashes")
             return
         self.flash_overlay.setGeometry(self.rect())
         self.flash_overlay.raise_()
         self.flash_overlay.show()
-        self._flash_count += 1
-        QTimer.singleShot(180, self._hide_flash)
+        self._flash_index += 1
+        QTimer.singleShot(150, self._hide_flash)
 
     def _hide_flash(self):
         self.flash_overlay.hide()
-        QTimer.singleShot(350, self._do_flash)
+        QTimer.singleShot(300, self._advance_flash)
 
     def resizeEvent(self, event):
         self.flash_overlay.setGeometry(self.rect())
         super().resizeEvent(event)
 
-    # ── run librosa analysis ───────────────────────────────────────────────────
+    # ── run analysis ───────────────────────────────────────────────────────────
     def run_analysis(self):
         if not self.audio_path:
             QMessageBox.warning(self, "No file", "Please load an audio file first.")
             return
 
         self.analyze_btn.setEnabled(False)
-        self.analyze_btn.setText("Analyzing...")
+        self.analyze_btn.setText("Analyzing…")
         self.export_label.hide()
+        self.flash_btn.setEnabled(False)
 
         self.worker = AnalyzeWorker(
             audio_path  = self.audio_path,
-            sensitivity = self.sliders["sensitivity"].value() / 100,
+            sensitivity = self.sliders["sensitivity"].value() / 100.0,
             max_markers = self.sliders["max_markers"].value(),
-            min_gap     = self.sliders["min_gap"].value(),
+            min_gap     = float(self.sliders["min_gap"].value()),
             top_n       = self.sliders["top_n"].value(),
         )
         self.worker.finished.connect(self.on_analysis_done)
         self.worker.error.connect(self.on_analysis_error)
         self.worker.start()
 
-    def on_analysis_done(self, csv_path):
+    # ── called when AnalyzeWorker emits finished(csv_path) ────────────────────
+    def on_analysis_done(self, csv_path: str):
         self.analyze_btn.setEnabled(True)
         self.analyze_btn.setText("Analyze and export CSV")
 
-        # inject csv path into resolve script
+        # inject csv path into resolve script so it points at this run's file
         self._inject_csv_path(csv_path)
 
-        self.export_label.setText(f"CSV saved to {csv_path}")
+        self.export_label.setText(f"Saved → {csv_path}")
         self.export_label.show()
 
-        # update stat cards — pull real values from your analyze module
-        try:
-            import json
-            manifest_path = csv_path.replace(".csv", ".json")
-            if os.path.exists(manifest_path):
-                with open(manifest_path) as f:
-                    m = json.load(f)
-                self.stat_labels["BPM"].setText(str(round(m.get("bpm", 0))))
-                self.stat_labels["Peaks"].setText(str(m.get("peak_count", "—")))
-                self.stat_labels["Beats"].setText(str(m.get("beat_count", "—")))
-                self.stat_labels["Mood"].setText(m.get("mood", "—"))
-                self.stat_labels["Mood"].setStyleSheet(
-                    "font-size: 13px; font-weight: 500; color: #534AB7;"
-                )
-                # populate timestamps
-                for i in reversed(range(self.ts_layout.count())):
-                    self.ts_layout.itemAt(i).widget().deleteLater()
-                for ts in m.get("top_peaks", [])[:8]:
-                    row = QLabel(f"{ts['time_fmt']}  —  {round(ts['strength']*100)}%")
-                    row.setStyleSheet("font-size: 11px; font-family: monospace; color: #333;")
-                    self.ts_layout.addWidget(row)
-        except Exception:
-            pass
+        # load the JSON manifest written by analyze_audio()
+        json_path = csv_path.replace(".csv", ".json")
+        if os.path.exists(json_path):
+            with open(json_path, encoding="utf-8") as f:
+                m = json.load(f)
 
-    def on_analysis_error(self, msg):
+            # stat cards
+            self.stat_labels["BPM"].setText(str(round(m.get("bpm", 0))))
+            self.stat_labels["Peaks"].setText(str(m.get("peak_count", "—")))
+            self.stat_labels["Beats"].setText(str(m.get("beat_count", "—")))
+            self.stat_labels["Mood"].setText(m.get("mood", "—"))
+            self.stat_labels["Mood"].setStyleSheet(
+                "font-size: 13px; font-weight: 500; color: #534AB7;"
+            )
+
+            # store cut points so flash preview can use them
+            self.cut_points = m.get("cut_points", [])
+
+            # timestamp list
+            for i in reversed(range(self.ts_layout.count())):
+                w = self.ts_layout.itemAt(i).widget()
+                if w:
+                    w.deleteLater()
+            for peak in m.get("top_peaks", [])[:8]:
+                row = QLabel(
+                    f"{peak['time_fmt']}  —  {round(peak['strength'] * 100)}%"
+                )
+                row.setStyleSheet("font-size: 11px; font-family: monospace; color: #333;")
+                self.ts_layout.addWidget(row)
+
+        # enable flash preview now that we have real cut points
+        if self.cut_points:
+            self.flash_btn.setEnabled(True)
+
+    # ── called when AnalyzeWorker emits error(msg) ─────────────────────────────
+    def on_analysis_error(self, msg: str):
         self.analyze_btn.setEnabled(True)
         self.analyze_btn.setText("Analyze and export CSV")
         QMessageBox.critical(self, "Analysis error", msg)
 
-    # ── inject csv path into resolve script ────────────────────────────────────
-    def _inject_csv_path(self, csv_path):
+    # ── patch resolve script with the new csv path ─────────────────────────────
+    def _inject_csv_path(self, csv_path: str):
         if not os.path.exists(RESOLVE_SCRIPT_PATH):
             return
-        with open(RESOLVE_SCRIPT_PATH, "r") as f:
-            content = f.read()
-        # replaces whatever is currently assigned to CSV_PATH
         import re
+        with open(RESOLVE_SCRIPT_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
         content = re.sub(
-            r'CSV_PATH\s*=\s*".*?"',
-            f'CSV_PATH = "{csv_path}"',
-            content
+            r'CSV_FILEPATH\s*=\s*".*?"',
+            f'CSV_FILEPATH = "{csv_path}"',
+            content,
         )
-        with open(RESOLVE_SCRIPT_PATH, "w") as f:
+        with open(RESOLVE_SCRIPT_PATH, "w", encoding="utf-8") as f:
             f.write(content)
 
 
@@ -518,17 +548,13 @@ class BeatFrameApp(QMainWindow):
         self.setWindowTitle("BeatFrame")
         self.setMinimumSize(680, 520)
 
-        # check for resolve script on startup
-        if not os.path.exists(RESOLVE_SCRIPT_PATH):
+        if not os.path.exists(OUTPUT_DIR):
             dialog = InstallDialog(self)
             dialog.exec()
 
-        # stacked pages
         self.landing  = LandingPage()
         self.analysis = AnalysisPage()
-
         self.landing.get_started.connect(self.show_analysis)
-
         self.setCentralWidget(self.landing)
 
     def show_analysis(self):

@@ -1,67 +1,5 @@
-import librosa
-import numpy as np
-
-# Helper to format seconds as MM:SS
-def format_mm_ss(seconds):
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{minutes}:{secs:02d}"  # was unindented
-
-# def analyze_audio('Overture.mp3'):
-#     # 1. Load audio
-#     y, sr = librosa.load('Overture.mp3')
-
-#     # 2. Beat tracking
-#     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-#     tempo = float(tempo[0])
-#     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-#     #print('Estimated tempo: {:.2f} beats per minute'.format(tempo))
-
-#     # 3. Onset strength
-#     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-#     times = librosa.times_like(onset_env, sr=sr)
-#     norm_strength = onset_env/onset_env.max()
-
-#     peaks = librosa.util.peak_pick(
-#         norm_strength,
-#         pre_max=3,
-#         post_max=3,
-#         pre_avg=3,
-#         post_avg=3,
-#         delta=0.10,
-#         wait=30
-#     )
-
-#     #peak_times = times[peaks]
-#     #peak_strengths = norm_strength[peaks]
-
-#     # 4. Filter to strong hits
-#     important = peaks[norm_strength[peaks] > 0.35]
-#     important_times = times[important]
-#     print(f"Found {len(important_times)} important peaks")  # add this to debug
-
-#     # 5. Align beats to nearest strong peak
-#     strongest_cut_points = []
-#     for bt in beat_times:
-#         if len(important_times) == 0:  # guard against empty
-#             strongest_cut_points.append(bt)
-#             continue
-#         nearest_peak = min(important_times, key=lambda x: abs(x - bt))
-#         if abs(nearest_peak - bt) < 0.1:
-#             strongest_cut_points.append(nearest_peak)
-
-#     # 6. Print results
-#     duration = len(y) / sr
-#     aligned = sorted(set(strongest_cut_points))
-
-#     print(f'Audio duration: {duration:.2f} seconds')
-#     print("Strongest beat timestamps:")
-#     for ts in aligned:
-#         print(f"- {format_mm_ss(ts)} ({ts:.2f} seconds)")
-#     print(f"Total aligned strongest beat timestamps: {len(aligned)}")
-#     return aligned # ui.py will use this list
-
 import csv
+import json
 import os
 from typing import List, Dict, Any
 
@@ -69,88 +7,133 @@ import librosa
 import numpy as np
 
 
-def analyze_audio_file(audio_path: str) -> Dict[str, Any]:
-    y, sr = librosa.load(audio_path)
+def format_mm_ss(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}:{secs:05.2f}"
 
+
+def analyze_audio(
+    audio_path: str,
+    sensitivity: float = 0.70,
+    max_markers: int = 20,
+    min_gap: float = 3.0,
+    top_n: int = 15,
+    output_dir: str = ".",
+) -> str:
+    """
+    Analyze audio and write both a CSV and a JSON manifest.
+    Returns the CSV path (what AnalyzeWorker emits via finished signal).
+    """
+    y, sr = librosa.load(audio_path)
+    duration = float(len(y) / sr)
+
+    # ── tempo + beats ──────────────────────────────────────────────────────────
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
     tempo = float(np.ravel(tempo)[0])
-
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
 
+    # ── onset strength ─────────────────────────────────────────────────────────
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     if onset_env.size == 0 or onset_env.max() == 0:
-        return {
-            "tempo": tempo,
-            "beat_times": [],
-            "cut_points": [],
-        }
+        cut_points = [float(t) for t in beat_times[:max_markers]]
+        top_peaks = []
+    else:
+        times = librosa.times_like(onset_env, sr=sr)
+        norm_onset = onset_env / onset_env.max()
 
-    times = librosa.times_like(onset_env, sr=sr)
-    norm_onset = onset_env / onset_env.max()
+        # min_gap slider → wait frames so spacing is enforced at detection time
+        wait_frames = max(1, int(min_gap * sr / 512))
 
-    peaks = librosa.util.peak_pick(
-        norm_onset,
-        pre_max=3,
-        post_max=3,
-        pre_avg=3,
-        post_avg=3,
-        delta=0.15,
-        wait=5,
-    )
+        # sensitivity slider (0-1) maps to delta (0.05 – 0.40)
+        delta = 0.05 + (1.0 - sensitivity) * 0.35
 
-    peak_times = times[peaks]
-    peak_strengths = norm_onset[peaks]
+        peaks = librosa.util.peak_pick(
+            norm_onset,
+            pre_max=3,
+            post_max=3,
+            pre_avg=3,
+            post_avg=3,
+            delta=delta,
+            wait=wait_frames,
+        )
 
-    important_mask = peak_strengths >= 0.25
-    important_times = peak_times[important_mask]
-    important_strengths = peak_strengths[important_mask]
+        peak_times = times[peaks]
+        peak_strengths = norm_onset[peaks]
 
-    cut_points: List[float] = []
-    window = 0.5
-    max_dist = 0.1
+        # keep peaks above 0.25 normalised strength
+        important_mask = peak_strengths >= 0.25
+        important_times = peak_times[important_mask]
+        important_strengths = peak_strengths[important_mask]
 
-    for bt in beat_times:
-        local_mask = np.abs(important_times - bt) <= window
-        local_times = important_times[local_mask]
-        local_strengths = important_strengths[local_mask]
+        # snap beats → nearest strong peak within 100 ms
+        cut_points: List[float] = []
+        snap_window = 0.5
+        max_dist = 0.1
 
-        if len(local_times) == 0:
-            continue
+        for bt in beat_times:
+            local_mask = np.abs(important_times - bt) <= snap_window
+            local_times = important_times[local_mask]
+            local_str = important_strengths[local_mask]
+            if len(local_times) == 0:
+                continue
+            best_idx = np.argmax(local_str)
+            nearest = local_times[best_idx]
+            if abs(nearest - bt) < max_dist:
+                cut_points.append(float(nearest))
 
-        best_idx = np.argmax(local_strengths)
-        nearest_peak = local_times[best_idx]
+        # deduplicate, sort, cap at max_markers
+        cut_points = sorted(set(round(t, 4) for t in cut_points))
+        cut_points = [float(t) for t in cut_points[:max_markers]]
 
-        if abs(nearest_peak - bt) < max_dist:
-            cut_points.append(float(nearest_peak))
+        # top_n strongest peaks (for the timestamp list in the UI)
+        if len(important_times) > 0:
+            sorted_by_strength = np.argsort(important_strengths)[::-1][:top_n]
+            top_peaks = [
+                {
+                    "time_seconds": float(important_times[i]),
+                    "time_fmt": format_mm_ss(float(important_times[i])),
+                    "strength": float(important_strengths[i]),
+                }
+                for i in sorted_by_strength
+            ]
+            top_peaks.sort(key=lambda x: x["time_seconds"])
+        else:
+            top_peaks = []
 
-    cut_points = list(dict.fromkeys(np.round(cut_points, 4)))
-    cut_points = [float(t) for t in cut_points]
+    # ── mood heuristic ─────────────────────────────────────────────────────────
+    if tempo < 90:
+        mood = "Chill"
+    elif tempo < 130:
+        mood = "Upbeat"
+    elif tempo < 160:
+        mood = "Energetic"
+    else:
+        mood = "Intense"
 
-    return {
-        "tempo": tempo,
-        "beat_times": [float(t) for t in beat_times],
+    # ── write CSV ──────────────────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    csv_path = os.path.join(output_dir, f"{base}_timestamps.csv")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_seconds", "time_fmt"])
+        for t in cut_points:
+            writer.writerow([t, format_mm_ss(t)])
+
+    # ── write JSON manifest (read by on_analysis_done) ─────────────────────────
+    manifest = {
+        "bpm": round(tempo, 1),
+        "peak_count": len(cut_points),
+        "beat_count": int(len(beat_times)),
+        "mood": mood,
+        "duration": round(duration, 2),
         "cut_points": cut_points,
+        "top_peaks": top_peaks,
     }
-
-
-def write_csv(cut_points: List[float], csv_path: str) -> str:
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["time_seconds"])
-        writer.writerows([[t] for t in cut_points])
+    json_path = csv_path.replace(".csv", ".json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
     return csv_path
-
-
-def analyze_and_export(audio_path: str, csv_path: str = "timestamps.csv") -> Dict[str, Any]:
-    result = analyze_audio_file(audio_path)
-    written_csv = write_csv(result["cut_points"], csv_path)
-
-    return {
-        "tempo": result["tempo"],
-        "beat_times": result["beat_times"],
-        "cut_points": result["cut_points"],
-        "csv_path": written_csv,
-    }
