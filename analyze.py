@@ -113,8 +113,7 @@ def analyze_audio(
 
     # ── write CSV ──────────────────────────────────────────────────────────────
     os.makedirs(output_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(audio_path))[0]
-    csv_path = os.path.join(output_dir, f"{base}_timestamps.csv")
+    csv_path = os.path.join(output_dir, "timestamps.csv")
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)

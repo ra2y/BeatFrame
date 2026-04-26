@@ -12,26 +12,23 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QColor, QPalette
 
 # ── paths ──────────────────────────────────────────────────────────────────────
-OUTPUT_DIR          = os.path.expanduser("~/Documents/BeatFrame/")
+OUTPUT_DIR          = os.path.dirname(__file__)  # Project directory for timestamps.csv
 INSTALLER_SCRIPT    = os.path.join(os.path.dirname(__file__), "installer.py")
 
 # Path to BeatFrameScript.py in DaVinci Resolve's Scripts folder
-def get_resolve_script_path():
+def get_resolve_scripts_path():
     import platform
     from pathlib import Path
-    home = Path.home()
     system = platform.system()
-    
+
     if system == "Darwin":  # macOS
-        scripts_dir = home / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts"
+        return Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility")
     elif system == "Windows":
-        scripts_dir = home / "AppData/Roaming/Blackmagic Design/DaVinci Resolve/Support/Fusion/Scripts"
+        return Path(r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility")
     elif system == "Linux":
-        scripts_dir = home / ".local/share/DaVinciResolve/Fusion/Scripts"
+        return Path("/opt/resolve/Fusion/Scripts/Utility")
     else:
-        return None
-    
-    return scripts_dir / "BeatFrameScript.py"
+        raise Exception("Unsupported OS")
 
 
 # ── background worker ──────────────────────────────────────────────────────────
@@ -50,7 +47,9 @@ class AnalyzeWorker(QThread):
     def run(self):
         try:
             from analyze import analyze_audio          # ← matches the real function name
-            csv_path = analyze_audio(
+            csv_path = os.path.join(os.path.dirname(__file__), "timestamps.csv")  # Always use timestamps.csv
+            print(f"Analysis will write to: {csv_path}")
+            analyze_audio(
                 self.audio_path,
                 sensitivity  = self.sensitivity,
                 max_markers  = self.max_markers,
@@ -406,8 +405,9 @@ class AnalysisPage(QWidget):
         note_title = QLabel("Next step")
         note_title.setStyleSheet("font-size: 12px; font-weight: 500; color: #633806;")
         note_body = QLabel(
-            "Happy with the results? Go back to DaVinci Resolve "
-            "and run the resolve_apply.py script to place markers on your timeline."
+            "Happy with the results? Go back to DaVinci Resolve, "
+            "click Workspace at the top > Scripts > Utility > BeatFrameScript.py "
+            "to place markers on your timeline."
         )
         note_body.setStyleSheet("font-size: 11px; color: #854F0B;")
         note_body.setWordWrap(True)
@@ -545,13 +545,17 @@ class AnalysisPage(QWidget):
     # ── patch resolve script with the new csv path ─────────────────────────────
     def _inject_csv_path(self, csv_path: str):
         """Update the CSV path in BeatFrameScript.py inside DaVinci Resolve."""
-        resolve_script = get_resolve_script_path()
-        if not resolve_script or not os.path.exists(str(resolve_script)):
+        resolve_scripts_dir = get_resolve_scripts_path()
+        resolve_script = resolve_scripts_dir / "BeatFrameScript.py"
+        print(f"Updating BeatFrameScript.py at: {resolve_script}")
+        if not os.path.exists(str(resolve_script)):
+            print(f"Warning: BeatFrameScript.py not found at {resolve_script}")
             return
         import re
         # Normalize path to forward slashes (works on all platforms: Windows/Mac/Linux)
         # Windows: C:\path\file → C:/path/file | Mac/Linux: /path/file → /path/file (unchanged)
         csv_path_normalized = csv_path.replace('\\', '/')
+        print(f"Setting CSV path to: {csv_path_normalized}")
         with open(str(resolve_script), "r", encoding="utf-8") as f:
             content = f.read()
         content = re.sub(
@@ -578,10 +582,21 @@ class BeatFrameApp(QMainWindow):
         self.landing.get_started.connect(self.show_analysis)
         self.setCentralWidget(self.landing)
 
+    def closeEvent(self, event):
+        """Handle graceful shutdown when the app is closed."""
+        # Stop any running worker threads
+        if hasattr(self.analysis, 'worker') and self.analysis.worker and self.analysis.worker.isRunning():
+            self.analysis.worker.quit()
+            self.analysis.worker.wait(3000)  # Wait up to 3 seconds for clean shutdown
+        
+        # Accept the close event
+        event.accept()
+
     def _ensure_resolve_script_installed(self):
         """Check if DaVinci Resolve script exists; run installer if missing."""
-        resolve_script = get_resolve_script_path()
-        if resolve_script and not os.path.exists(str(resolve_script)):
+        resolve_scripts_dir = get_resolve_scripts_path()
+        resolve_script = resolve_scripts_dir / "BeatFrameScript.py"
+        if not os.path.exists(str(resolve_script)):
             print(f"BeatFrameScript.py not found at {resolve_script}. Running installer...")
             # Create output directory if it doesn't exist
             os.makedirs(OUTPUT_DIR, exist_ok=True)
